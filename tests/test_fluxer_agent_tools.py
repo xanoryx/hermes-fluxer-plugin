@@ -272,3 +272,26 @@ def test_scheme_refusal(monkeypatch):
     monkeypatch.setattr(agent_tools, "_get_secret", lambda key, default="": default)
     with pytest.raises(ValueError):
         agent_tools._fluxer_request("GET", "/x", "file:///etc", "tok")
+
+def test_guild_caches_are_scoped_by_base_and_profile(monkeypatch):
+    """Identical channel ids on two deployments must not share a guild mapping."""
+    agent_tools._HOME_GUILD_CACHE.clear()
+    agent_tools._CHANNEL_GUILD_CACHE.clear()
+    calls = []
+
+    def fake_request(method, path, base, token, params=None, body=None, timeout=15):
+        calls.append(base)
+        if base.endswith("/a"):
+            return {"id": "same-ch", "guild_id": "guild-a"}
+        return {"id": "same-ch", "guild_id": "guild-b"}
+
+    monkeypatch.setattr(agent_tools, "_fluxer_request", fake_request)
+    monkeypatch.setenv("HERMES_HOME", "/tmp/profile-a")
+    assert agent_tools._derive_home_guild("https://fluxer.example/a", "tok", "123456789012345678") == "guild-a"
+    monkeypatch.setenv("HERMES_HOME", "/tmp/profile-b")
+    assert agent_tools._derive_home_guild("https://fluxer.example/b", "tok", "123456789012345678") == "guild-b"
+    assert len(calls) == 2  # second profile/base must not reuse the first cache entry
+    assert agent_tools._channel_allowed(
+        "123456789012345678", "https://fluxer.example/b", "tok", "guild-b"
+    )
+

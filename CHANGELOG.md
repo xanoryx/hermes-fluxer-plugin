@@ -10,6 +10,15 @@ This project uses simple semantic versioning while the plugin is young:
 
 ## [Unreleased]
 
+### Added
+
+- Agent tools `flux_recall`, `flux_search`, `flux_members`, and `flux_audit` for read-only Fluxer guild/channel access. Reads are home-guild scoped by default (`FLUXER_TOOL_SCOPE=global` widens). Guild lookup caches are keyed by API base and Hermes profile home so multiplexed deployments do not reuse each other's mappings. Sessions see the tools once `fluxer` is listed in `platform_toolsets` (keep `[hermes-discord, fluxer]`).
+
+### Verification
+
+- Focused agent-tools suite covers registration, scoping, snowflake checks, URL normalization, and cache isolation across bases/profiles.
+- Live probes against the self-hosted build: all four tools → 200.
+
 ## [0.5.1] - 2026-10-13
 
 ### Fixed

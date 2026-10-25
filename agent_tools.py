@@ -16,6 +16,7 @@ convention via ``_merged``.
 from __future__ import annotations
 
 import json
+import os
 import logging
 import re
 import urllib.parse
@@ -118,12 +119,27 @@ def _is_snowflake(value: str) -> bool:
     return bool(_SNOWFLAKE_RE.match(value))
 
 
+def _cache_scope(base: str) -> str:
+    """Isolate guild caches per API deployment and Hermes profile home.
+
+    Channel snowflakes alone are not unique across restored backups or
+    multiplexed profiles that share numeric ids against different servers.
+    """
+    profile_home = (os.environ.get("HERMES_HOME") or "").strip()
+    return f"{base}|{profile_home}"
+
+
+def _cache_key(base: str, channel_id: str) -> str:
+    return f"{_cache_scope(base)}|{channel_id}"
+
+
 def _derive_home_guild(base: str, token: str, home_channel: str) -> str:
     """Home guild id derived from the home channel when FLUXER_HOME_GUILD_ID
     is unset, so scoping fails closed even in minimal configs."""
     if not home_channel or not _is_snowflake(home_channel):
         return ""
-    cached = _HOME_GUILD_CACHE.get(home_channel)
+    key = _cache_key(base, home_channel)
+    cached = _HOME_GUILD_CACHE.get(key)
     if cached is not None:
         return cached
     try:
@@ -132,7 +148,7 @@ def _derive_home_guild(base: str, token: str, home_channel: str) -> str:
         return ""
     guild = str((info or {}).get("guild_id") or "")
     if guild:
-        _HOME_GUILD_CACHE[home_channel] = guild
+        _HOME_GUILD_CACHE[key] = guild
     return guild
 
 
@@ -149,14 +165,15 @@ def _channel_allowed(channel_id: str, base: str, token: str, home_guild: str) ->
         return True
     if not home_guild:
         return False  # no home guild derivable: refuse rather than read anywhere
-    if channel_id in _CHANNEL_GUILD_CACHE:
-        return _CHANNEL_GUILD_CACHE[channel_id] == home_guild
+    key = _cache_key(base, channel_id)
+    if key in _CHANNEL_GUILD_CACHE:
+        return _CHANNEL_GUILD_CACHE[key] == home_guild
     try:
         info = _fluxer_request("GET", f"/channels/{urllib.parse.quote(channel_id)}", base, token)
     except Exception:
         return False
     guild = str((info or {}).get("guild_id") or "")
-    _CHANNEL_GUILD_CACHE[channel_id] = guild or None
+    _CHANNEL_GUILD_CACHE[key] = guild or None
     return guild == home_guild
 
 
