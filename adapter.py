@@ -639,6 +639,23 @@ def _open_session_store(home: Optional[Path] = None) -> Optional[Any]:
         return None
 
 
+def _is_body_rejection(exc: BaseException) -> bool:
+    """True for an explicit 400/422: the body was refused, the request may be
+    retried in reduced form. Transient failures (429/5xx/timeouts) never
+    qualify — retrying those could double-post an already delivered message."""
+    response = getattr(exc, "response", None)
+    return getattr(response, "status_code", None) in (400, 422)
+
+
+def _body_mentions(exc: BaseException, word: str):
+    """Whether the 4xx response body names ``word``; None when unreadable."""
+    response = getattr(exc, "response", None)
+    try:
+        return word in (response.text or "").lower()
+    except Exception:
+        return None
+
+
 def _is_missing_channel_error(exc: BaseException) -> bool:
     """True when ``exc`` means the target channel or thread no longer exists.
 
@@ -1303,6 +1320,14 @@ class FluxerAdapter(BasePlatformAdapter):
         self._native_command_guild_ids = _split_ids(
             _fluxer_env("FLUXER_NATIVE_COMMAND_GUILDS") or extra.get("native_command_guilds")
         )
+        # Outbound rich embeds via metadata["embeds"]. On by default; a build
+        # that rejects the embeds field disables them for the session instead
+        # of losing messages (mirrors the components compatibility gate).
+        self._outbound_embeds_enabled = _coerce_bool(
+            _fluxer_env("FLUXER_OUTBOUND_EMBEDS", extra.get("outbound_embeds")),
+            True,
+        )
+        self._outbound_embeds_supported = True
         self._mentioned_threads: OrderedDict[str, None] = OrderedDict()
         self._mentioned_threads_max = 5000
         self._home_channel_ids: set[str] = set()
@@ -1536,6 +1561,63 @@ class FluxerAdapter(BasePlatformAdapter):
         payload.update(extra)
         return payload
 
+    def _edit_payload_for(self, content: str, metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """PATCH payload for ``edit_message``: content always; embeds only when
+        the caller supplied them (PATCH replaces the whole list, so an edit
+        without embeds must leave the message's embeds untouched)."""
+        meta = metadata or {}
+        if "embeds" not in meta or not (self._outbound_embeds_enabled and self._outbound_embeds_supported):
+            return self._outbound_message_payload(content)
+        embeds = self._normalize_outbound_embeds(meta["embeds"])
+        if not embeds:
+            # Junk embeds (non-dict entries) are treated as "not supplied":
+            # PATCH replaces the whole list, so an empty list would wipe the
+            # message's existing embeds.
+            return self._outbound_message_payload(content)
+        return self._outbound_message_payload(content, embeds=embeds)
+
+    @staticmethod
+    def _normalize_outbound_embeds(value: Any) -> List[Dict[str, Any]]:
+        """Coerce ``metadata["embeds"]`` into safe rich-embed dicts (≤10).
+        Only shape work lives here: non-dicts are dropped, a lone dict becomes a
+        one-element list, ``type`` is forced to ``rich`` (the only sendable kind),
+        and the documented per-field caps (title 256, description 4096) are
+        clamped so a long field cannot turn one bad embed into a rejected
+        request. Deeper validation stays with the server.
+        """
+        if isinstance(value, dict):
+            value = [value]
+        if not isinstance(value, list):
+            return []
+        embeds: List[Dict[str, Any]] = []
+        for entry in value[:10]:
+            if not isinstance(entry, dict):
+                continue
+            embed = {k: v for k, v in entry.items() if k != "type"}
+            embed["type"] = "rich"
+            embed = dict(embed)  # never mutate the caller's dicts
+            if isinstance(embed.get("title"), str):
+                embed["title"] = embed["title"][:256]
+            if isinstance(embed.get("description"), str):
+                embed["description"] = embed["description"][:4096]
+            if isinstance(embed.get("footer"), dict):
+                embed["footer"] = dict(embed["footer"])
+                if isinstance(embed["footer"].get("text"), str):
+                    embed["footer"]["text"] = embed["footer"]["text"][:2048]
+            if isinstance(embed.get("author"), dict):
+                embed["author"] = dict(embed["author"])
+                if isinstance(embed["author"].get("name"), str):
+                    embed["author"]["name"] = embed["author"]["name"][:256]
+            fields = embed.get("fields")
+            if isinstance(fields, list):
+                embed["fields"] = [
+                    {k: (v[:256] if k == "name" and isinstance(v, str) else v[:1024] if k == "value" and isinstance(v, str) else v)
+                     for k, v in f.items() if k in ("name", "value", "inline")}
+                    for f in fields[:25] if isinstance(f, dict)
+                ]
+            embeds.append(embed)
+        return embeds
+
     async def _add_reaction(self, chat_id: str, message_id: str, emoji: str) -> None:
         await self._request(
             "PUT",
@@ -1625,6 +1707,11 @@ class FluxerAdapter(BasePlatformAdapter):
             # the triggering message, then the channel itself.
             target_chat_id, payload, auto_thread_id = await self._resolve_outbound_target(chat_id, reply_to, metadata)
             self._known_channel_ids.add(str(target_chat_id))
+            embeds = (
+                self._normalize_outbound_embeds((metadata or {}).get("embeds"))
+                if self._outbound_embeds_enabled
+                else []
+            )
 
             # Mention neutralization inserts zero-width characters. Apply it
             # before measuring so the final wire payload cannot cross Fluxer's
@@ -1636,6 +1723,9 @@ class FluxerAdapter(BasePlatformAdapter):
 
             for index, chunk in enumerate(chunks):
                 chunk_payload = self._outbound_message_payload(chunk, **payload)
+                if index == 0 and embeds and self._outbound_embeds_supported:
+                    # Embeds ride the first chunk only; continuations are text.
+                    chunk_payload["embeds"] = embeds
                 if index > 0 and self._reply_to_mode != "all":
                     # "first" (default) and "off" keep the reference on the first
                     # split chunk only; repeating it on every continuation
@@ -1650,36 +1740,62 @@ class FluxerAdapter(BasePlatformAdapter):
                         json=chunk_payload,
                     )
                 except Exception as exc:
-                    # A thread this adapter chose can be deleted between the
-                    # progress bubble and the reply. Abandon it and post to the
-                    # parent channel rather than losing the message.
-                    if not (auto_thread_id and _is_missing_channel_error(exc)):
+                    thread_gone = bool(auto_thread_id) and _is_missing_channel_error(exc)
+                    if (
+                        embeds
+                        and index == 0
+                        and self._outbound_embeds_supported
+                        and not thread_gone
+                        and _is_body_rejection(exc)
+                    ):
+                        # The body was refused: deliver content-only and retry.
+                        # Embeds are disabled for the session only when the body
+                        # blames them (or is unreadable) — an unrelated 400 must
+                        # not silence embeds. Transient failures (429/5xx/timeout)
+                        # propagate untouched instead.
+                        # keep embeds enabled only when the body clearly blames another field
+                        self._outbound_embeds_supported = _body_mentions(exc, "embed") is False
+                        logger.warning(
+                            "Fluxer embed send rejected (%s); disabling outbound embeds",
+                            exc,
+                        )
+                        chunk_payload.pop("embeds", None)
+                        data = await self._request(
+                            "POST",
+                            f"/channels/{_quote_id(target_chat_id)}/messages",
+                            json=chunk_payload,
+                        )
+                    elif not thread_gone:
                         raise
-                    logger.info(
-                        "Fluxer thread %s is gone; falling back to channel %s",
-                        auto_thread_id,
-                        chat_id,
-                    )
-                    self._forget_thread(auto_thread_id)
-                    self._disable_turn_thread(chat_id, reply_to, metadata)
-                    auto_thread_id = None
-                    target_chat_id = str(chat_id)
-                    self._known_channel_ids.add(target_chat_id)
-                    if reply_to and self._reply_to_mode != "off":
-                        # Restore the reference in the shared payload as well: the
-                        # remaining chunks of a split reply are rebuilt from it, so
-                        # patching only this chunk would leave every later one
-                        # unlinked after a fallback. The mode still decides where
-                        # the reference lands.
-                        payload["message_reference"] = {"message_id": str(reply_to)}
-                        chunk_payload["message_reference"] = {"message_id": str(reply_to)}
-                        if index > 0 and self._reply_to_mode != "all":
-                            chunk_payload.pop("message_reference", None)
-                    data = await self._request(
-                        "POST",
-                        f"/channels/{_quote_id(target_chat_id)}/messages",
-                        json=chunk_payload,
-                    )
+                    else:
+                        # A thread this adapter chose can be deleted between the
+                        # progress bubble and the reply. Abandon it and post to the
+                        # parent channel rather than losing the message.
+                        logger.info(
+                            "Fluxer thread %s is gone; falling back to channel %s",
+                            auto_thread_id,
+                            chat_id,
+                        )
+                        self._forget_thread(auto_thread_id)
+                        self._disable_turn_thread(chat_id, reply_to, metadata)
+                        auto_thread_id = None
+                        target_chat_id = str(chat_id)
+                        self._known_channel_ids.add(target_chat_id)
+                        if reply_to and self._reply_to_mode != "off":
+                            # Restore the reference in the shared payload as well: the
+                            # remaining chunks of a split reply are rebuilt from it, so
+                            # patching only this chunk would leave every later one
+                            # unlinked after a fallback. The mode still decides where
+                            # the reference lands.
+                            payload["message_reference"] = {"message_id": str(reply_to)}
+                            chunk_payload["message_reference"] = {"message_id": str(reply_to)}
+                            if index > 0 and self._reply_to_mode != "all":
+                                chunk_payload.pop("message_reference", None)
+                        data = await self._request(
+                            "POST",
+                            f"/channels/{_quote_id(target_chat_id)}/messages",
+                            json=chunk_payload,
+                        )
                 responses.append(data)
                 if data.get("id"):
                     message_id = str(data["id"])
@@ -1867,11 +1983,26 @@ class FluxerAdapter(BasePlatformAdapter):
                     MAX_MESSAGE_LENGTH,
                     len_fn=utf16_len,
                 )[0]
-            data = await self._request(
-                "PATCH",
-                f"/channels/{_quote_id(target_chat_id)}/messages/{_quote_id(message_id)}",
-                json=self._outbound_message_payload(formatted),
-            )
+            edit_payload = self._edit_payload_for(formatted, metadata)
+            try:
+                data = await self._request(
+                    "PATCH",
+                    f"/channels/{_quote_id(target_chat_id)}/messages/{_quote_id(message_id)}",
+                    json=edit_payload,
+                )
+            except Exception as exc:
+                if "embeds" not in edit_payload or not _is_body_rejection(exc):
+                    raise
+                # Same compatibility gate as send(): deliver the edit without
+                # embeds rather than losing it; session-disable only when the
+                # body blames embeds (or is unreadable).
+                self._outbound_embeds_supported = _body_mentions(exc, "embed") is False
+                edit_payload.pop("embeds", None)
+                data = await self._request(
+                    "PATCH",
+                    f"/channels/{_quote_id(target_chat_id)}/messages/{_quote_id(message_id)}",
+                    json=edit_payload,
+                )
             # Intermediate streaming edits are intentionally not content-checked:
             # a later PATCH can land before this edit's GET read-back, making the
             # read-back newer than ``formatted`` and producing a false mismatch.
