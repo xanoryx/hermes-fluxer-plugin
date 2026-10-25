@@ -39,15 +39,31 @@ def _get_secret(key: str, default: str = "") -> str:
     return (get_secret(key, default) or default)
 
 
-def _resolve() -> Tuple[str, str, str, str]:
-    """(base_url, token, home_channel, guild_id) from the profile secret scope."""
-    base = _get_secret("FLUXER_BASE_URL").strip().rstrip("/")
-    for suffix in ("/api/v1", "/api", "/v1"):
-        if base.endswith(suffix):
-            base = base[: -len(suffix)]
+def _api_base(base_url: str) -> str:
+    """Normalize a Fluxer URL to the REST API base.
+
+    Same rules as ``adapter._api_base`` — kept local so this module stays
+    importable without the gateway stack that ``adapter`` pulls in.
+    """
+    base = (base_url or "").strip().rstrip("/")
     if not base:
-        # same default as the adapter, so config.yaml users need no extra secret
-        base = "https://api.fluxer.app/v1"
+        return ""
+    if (
+        base.endswith("/api")
+        or base.endswith("/api/v1")
+        or base.endswith("/v1")
+        or "/api/" in base
+    ):
+        return base
+    if base == "https://api.fluxer.app":
+        return f"{base}/v1"
+    return f"{base}/api"
+
+
+def _resolve() -> Tuple[str, str, str, str]:
+    """(api_base, token, home_channel, guild_id) from the profile secret scope."""
+    # Hosted default matches the adapter; already-scoped URLs are preserved.
+    base = _api_base(_get_secret("FLUXER_BASE_URL")) or _api_base("https://api.fluxer.app")
     token = _get_secret("FLUXER_BOT_TOKEN").strip()
     home = _get_secret("FLUXER_HOME_CHANNEL").strip()
     guild = _get_secret("FLUXER_HOME_GUILD_ID").strip() or _derive_home_guild(base, token, home)
@@ -59,7 +75,8 @@ def _fluxer_request(
     params: Optional[Dict[str, Any]] = None, body: Optional[Dict[str, Any]] = None,
     timeout: int = 15,
 ) -> Any:
-    url = f"{base}/api/v1{path}"
+    # ``base`` is already an API root (``…/v1`` or ``…/api``); do not append again.
+    url = f"{base}{path}"
     if params:
         url += "?" + urllib.parse.urlencode(params)
     if urllib.parse.urlparse(url).scheme not in ("http", "https"):

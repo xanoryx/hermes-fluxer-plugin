@@ -228,6 +228,46 @@ def test_base_url_defaults_to_hosted(monkeypatch):
     assert base == "https://api.fluxer.app/v1"
 
 
+def test_request_url_uses_resolved_api_base(monkeypatch):
+    """Default / hosted / self-hosted bases must not double-append /api/v1."""
+    seen = []
+
+    class _Resp:
+        def read(self, _n):
+            return b"{}"
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+
+    def fake_urlopen(req, timeout=15):
+        seen.append(req.full_url)
+        return _Resp()
+
+    monkeypatch.setattr(agent_tools.urllib.request, "urlopen", fake_urlopen)
+
+    agent_tools._fluxer_request("GET", "/channels/1", "https://api.fluxer.app/v1", "tok")
+    agent_tools._fluxer_request("GET", "/channels/1", "https://fluxer.example/api", "tok")
+    # resolve() output for an empty secret
+    monkeypatch.setattr(agent_tools, "_get_secret", lambda key, default="": default)
+    monkeypatch.setattr(agent_tools, "_derive_home_guild", lambda *a: "")
+    base, *_ = agent_tools._resolve()
+    agent_tools._fluxer_request("GET", "/channels/1", base, "tok")
+
+    assert seen == [
+        "https://api.fluxer.app/v1/channels/1",
+        "https://fluxer.example/api/channels/1",
+        "https://api.fluxer.app/v1/channels/1",
+    ]
+
+
+def test_api_base_preserves_scoped_and_hosted(monkeypatch):
+    assert agent_tools._api_base("https://api.fluxer.app") == "https://api.fluxer.app/v1"
+    assert agent_tools._api_base("https://api.fluxer.app/v1") == "https://api.fluxer.app/v1"
+    assert agent_tools._api_base("https://fluxer.example") == "https://fluxer.example/api"
+    assert agent_tools._api_base("https://fluxer.example/api/v1") == "https://fluxer.example/api/v1"
+
+
 def test_scheme_refusal(monkeypatch):
     monkeypatch.setattr(agent_tools, "_get_secret", lambda key, default="": default)
     with pytest.raises(ValueError):
