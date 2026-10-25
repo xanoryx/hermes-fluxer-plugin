@@ -10,6 +10,15 @@ This project uses simple semantic versioning while the plugin is young:
 
 ## [Unreleased]
 
+### Added
+
+- Outbound messages and edits can carry rich embeds through `metadata["embeds"]` (or the `FLUXER_OUTBOUND_EMBEDS` off switch). Builds that reject the field fall back to content-only; the session disables embeds only when the response body blames them. Concurrent sends and thread-gone parent retries use the same payload-based fallback so text is not lost.
+
+### Verification
+
+- Focused embeds suite covers normalization, first-chunk placement, junk-edit guard, body-blame discrimination, concurrent flag races, and thread-gone parent degrade.
+- Live probe: create + edit with embeds → 200 on the self-hosted build.
+
 ## [0.5.1] - 2026-10-13
 
 ### Fixed

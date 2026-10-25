@@ -140,3 +140,51 @@ async def test_edit_degrade_disabled_when_body_blames_embeds():
     adapter._request = AsyncMock(side_effect=[rejected, {"id": "m1"}])
     await adapter.edit_message("channel", "m1", "edited", metadata={"embeds": [{"title": "t"}]})
     assert adapter._outbound_embeds_supported is False
+
+@pytest.mark.asyncio
+async def test_embed_rejection_uses_payload_not_session_flag():
+    """A concurrent sibling may flip the session flag mid-flight; this payload
+    still carries embeds and must still degrade to text."""
+    adapter = make_adapter()
+    rejected = RuntimeError("400 INVALID_FORM_BODY")
+    rejected.response = SimpleNamespace(  # type: ignore[attr-defined]
+        status_code=400, text='{"embeds":["invalid"]}'
+    )
+    snapshots = []
+
+    async def flip_then_maybe_ok(*_a, **kwargs):
+        # Copy before the degrade path mutates the same dict in place.
+        snapshots.append(dict(kwargs.get("json") or {}))
+        if len(snapshots) == 1:
+            adapter._outbound_embeds_supported = False
+            raise rejected
+        return {"id": "fallback"}
+
+    adapter._request = AsyncMock(side_effect=flip_then_maybe_ok)
+    result = await adapter.send("channel", "hi", metadata={"embeds": [{"title": "t"}]})
+    assert result.success
+    assert len(snapshots) == 2
+    assert "embeds" in snapshots[0]
+    assert "embeds" not in snapshots[1]
+
+
+@pytest.mark.asyncio
+async def test_thread_gone_parent_embed_rejection_degrades():
+    """Thread 404 then parent 400 on embeds must still deliver content-only."""
+    adapter = make_adapter({"thread_replies": True})
+    missing = RuntimeError("10003 UNKNOWN_CHANNEL")
+    missing.response = SimpleNamespace(status_code=404)  # type: ignore[attr-defined]
+    rejected = RuntimeError("400 INVALID_FORM_BODY")
+    rejected.response = SimpleNamespace(  # type: ignore[attr-defined]
+        status_code=400, text='{"embeds":["invalid"]}'
+    )
+    adapter._request = AsyncMock(side_effect=[missing, rejected, {"id": "parent-text"}])
+    adapter.create_thread = AsyncMock(return_value={"id": "doomed-thread"})
+    result = await adapter.send(
+        "channel", "hi", reply_to="trigger", metadata={"embeds": [{"title": "t"}]}
+    )
+    assert result.success
+    payloads = sent_payloads(adapter)
+    assert "embeds" not in payloads[-1]
+    assert adapter._outbound_embeds_supported is False
+

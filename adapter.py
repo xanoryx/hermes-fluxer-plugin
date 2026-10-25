@@ -1742,18 +1742,18 @@ class FluxerAdapter(BasePlatformAdapter):
                 except Exception as exc:
                     thread_gone = bool(auto_thread_id) and _is_missing_channel_error(exc)
                     if (
-                        embeds
-                        and index == 0
-                        and self._outbound_embeds_supported
+                        index == 0
+                        and "embeds" in chunk_payload
                         and not thread_gone
                         and _is_body_rejection(exc)
                     ):
-                        # The body was refused: deliver content-only and retry.
+                        # Gate on this payload, not the session flag: a concurrent
+                        # sibling may already have flipped ``_outbound_embeds_supported``
+                        # while this request (still carrying embeds) is in flight.
                         # Embeds are disabled for the session only when the body
                         # blames them (or is unreadable) — an unrelated 400 must
                         # not silence embeds. Transient failures (429/5xx/timeout)
                         # propagate untouched instead.
-                        # keep embeds enabled only when the body clearly blames another field
                         self._outbound_embeds_supported = _body_mentions(exc, "embed") is False
                         logger.warning(
                             "Fluxer embed send rejected (%s); disabling outbound embeds",
@@ -1791,11 +1791,35 @@ class FluxerAdapter(BasePlatformAdapter):
                             chunk_payload["message_reference"] = {"message_id": str(reply_to)}
                             if index > 0 and self._reply_to_mode != "all":
                                 chunk_payload.pop("message_reference", None)
-                        data = await self._request(
-                            "POST",
-                            f"/channels/{_quote_id(target_chat_id)}/messages",
-                            json=chunk_payload,
-                        )
+                        try:
+                            data = await self._request(
+                                "POST",
+                                f"/channels/{_quote_id(target_chat_id)}/messages",
+                                json=chunk_payload,
+                            )
+                        except Exception as parent_exc:
+                            # Parent retry still carries embeds when the thread 404'd
+                            # first; apply the same content-only fallback so a build
+                            # that rejects embeds does not lose the message.
+                            if not (
+                                "embeds" in chunk_payload
+                                and _is_body_rejection(parent_exc)
+                            ):
+                                raise
+                            self._outbound_embeds_supported = (
+                                _body_mentions(parent_exc, "embed") is False
+                            )
+                            logger.warning(
+                                "Fluxer embed send rejected on parent fallback (%s); "
+                                "disabling outbound embeds",
+                                parent_exc,
+                            )
+                            chunk_payload.pop("embeds", None)
+                            data = await self._request(
+                                "POST",
+                                f"/channels/{_quote_id(target_chat_id)}/messages",
+                                json=chunk_payload,
+                            )
                 responses.append(data)
                 if data.get("id"):
                     message_id = str(data["id"])
